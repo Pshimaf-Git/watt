@@ -19,6 +19,7 @@ pub struct VmSettings {
     gc_threshold_grow_factor: usize,
     gc_debug: bool,
 }
+
 /// Vm settings implementation
 impl VmSettings {
     pub fn new(gc_threshold: usize, gc_threshold_grow_factor: usize, gc_debug: bool) -> Self {
@@ -30,10 +31,6 @@ impl VmSettings {
     }
 }
 
-/// Virtual machine
-///
-/// Vm that runs opcodes 🤔
-///
 #[derive(Debug)]
 pub struct VM {
     pub globals: *mut Table,
@@ -45,6 +42,7 @@ pub struct VM {
     settings: VmSettings,
     pub stack: Vec<Value>,
 }
+
 /// Vm implementation
 #[allow(non_upper_case_globals)]
 #[allow(unused_qualifications)]
@@ -70,13 +68,22 @@ impl VM {
         vm
     }
 
-    /// Push value to vm stack
+    /// Check and wait if GC is in progress (stop-the-world)
+    unsafe fn check_gc_stop_the_world(&self) {
+        if (*self.gc).is_gc_in_progress() {
+            (*self.gc).wait_for_gc();
+        }
+    }
+
     pub unsafe fn push(&mut self, value: Value) {
+        self.check_gc_stop_the_world();
         self.stack.push(value);
     }
 
-    /// Pop value from vm stack
     pub fn pop(&mut self, address: &Address) -> Value {
+        unsafe {
+            self.check_gc_stop_the_world();
+        }
         if self.stack.is_empty() {
             error!(Error::new(
                 address.clone(),
@@ -120,6 +127,7 @@ impl VM {
     /// | gc invokes
     /// | gc_threshold multiplies by 2
     pub unsafe fn gc_register(&mut self, value: Value, table: *mut Table) {
+        self.check_gc_stop_the_world();
         // adding object
         (*self.gc).add_object(value);
         // checking gc threshold
@@ -2108,6 +2116,9 @@ impl VM {
     #[allow(unused_variables)]
     pub unsafe fn run(&mut self, chunk: &Chunk, table: *mut Table) -> Result<(), ControlFlow> {
         for op in chunk.opcodes() {
+            // Check for GC stop-the-world before each operation
+            self.check_gc_stop_the_world();
+
             match op {
                 Opcode::Push { addr, value } => {
                     self.op_push(value.clone(), table)?;
