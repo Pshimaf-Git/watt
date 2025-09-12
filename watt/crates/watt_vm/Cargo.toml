@@ -16,3 +16,6 @@ rustc-hash = "2.1.1"
 libloading = "0.8.8"
 libffi = "4.1.1"
 minreq = { version = "2.14.0", features = ["https"] }
+tokio = { version = "1.0", features = ["full", "sync"] }
+dashmap = "5.5.3"
+futures = "0.3"
