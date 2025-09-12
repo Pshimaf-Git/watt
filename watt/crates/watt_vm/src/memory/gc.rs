@@ -5,6 +5,9 @@ use crate::values::{FnOwner, Value};
 use crate::vm::VM;
 use rustc_hash::FxHashSet;
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{self};
 
 /// Garbage collector
 ///
@@ -13,6 +16,7 @@ use std::borrow::Cow;
 /// * `marked_tables`: contains all marked tables during collect_garbage.
 /// * `guard`: contains all guarded from garbage collection objects.
 /// * `debug`: enable/disable debug messages
+/// * `gc_in_progress`: atomic flag indicating if GC is in progress (stop-the-world)
 ///
 #[derive(Debug)]
 pub struct GC {
@@ -21,11 +25,14 @@ pub struct GC {
     marked_tables: FxHashSet<*mut Table>,
     guard: Vec<Value>,
     debug: bool,
+    gc_in_progress: Arc<AtomicBool>,
 }
+
 
 /// Mark & sweep garbage collector implementation
 impl GC {
     /// New gc
+    // New gc
     pub fn new(debug: bool) -> GC {
         GC {
             objects: FxHashSet::default(),
@@ -33,6 +40,7 @@ impl GC {
             marked_tables: FxHashSet::default(),
             guard: Vec::new(),
             debug,
+            gc_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -42,6 +50,30 @@ impl GC {
         if self.debug {
             println!("{}", message());
         }
+    }
+
+    /// Check if GC is in progress (stop-the-world)
+    pub fn is_gc_in_progress(&self) -> bool {
+        self.gc_in_progress.load(Ordering::SeqCst)
+    }
+
+    /// Wait for GC to complete (for VM threads)
+    pub fn wait_for_gc(&self) {
+        let dur = time::Instant::now();
+        self.log(|| Cow::Owned(format!("gc :: start :: wait")));
+        while self.is_gc_in_progress() {
+            // Yield to avoid busy waiting
+            std::thread::yield_now();
+        }
+        self.log(|| Cow::Owned(format!("gc :: end :: wait :: elapsed = {:?}s", dur.elapsed().as_secs())));
+    }
+
+    fn stop_the_world(&self) {
+        self.gc_in_progress.store(true, Ordering::SeqCst);
+    }
+
+    fn resume_world(&self) {
+        self.gc_in_progress.store(false,Ordering::SeqCst);
     }
 
     /// Resets `marked` and `marked_tables` after garbage collection
@@ -147,7 +179,7 @@ impl GC {
     ///
     fn sweep(&mut self) {
         // logging sweep is running
-        self.log(|| Cow::Borrowed("gc :: sweep :: running"));
+        self.log(|| Cow::Borrowed("gc :: start :: sweep"));
         // finding unmarked objects
         let mut to_free = vec![];
         self.objects.retain(|value| {
@@ -162,6 +194,8 @@ impl GC {
         for value in to_free {
             self.free_value(value);
         }
+
+        self.log(|| Cow::Borrowed("gc :: end :: sweep"));
     }
 
     /// Adding object to allocated list
@@ -178,6 +212,7 @@ impl GC {
             | Value::List(_)
             | Value::Any(_) => {
                 if !self.objects.contains(&value) {
+                    self.log(|| Cow::Owned(format!("gc :: add object :: obj = {value:?}")));
                     self.objects.insert(value);
                 }
             }
@@ -251,8 +286,11 @@ impl GC {
     /// Has medium runtime cost
     ///
     pub unsafe fn collect_garbage(&mut self, vm: &mut VM, table: *mut Table) {
+        // Set stop-the-world flag
+        self.stop_the_world();
+        
         // logging gc is triggered
-        self.log(|| Cow::Borrowed("gc :: triggered"));
+        self.log(|| Cow::Borrowed("gc :: triggered :: stop-the-world"));
 
         // mark phase
         // > stack
@@ -276,8 +314,11 @@ impl GC {
         // reset gc mark vectors
         self.reset();
 
+        // Clear stop-the-world flag
+        self.resume_world();
+
         // log gc ended
-        self.log(|| Cow::Borrowed("gc :: end"));
+        self.log(|| Cow::Borrowed("gc :: end :: stop-the-world released"));
     }
 
     /// Allocated values amount
@@ -329,6 +370,10 @@ impl Drop for GcGuard {
 #[macro_export]
 macro_rules! gc_guard {
     ($gc:expr, $value:expr) => {
+        // Check for GC stop-the-world before creating guard
+        if (*$gc).is_gc_in_progress() {
+            (*$gc).wait_for_gc();
+        }
         let _guard = GcGuard::new($gc, $value);
     };
 }
